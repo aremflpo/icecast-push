@@ -1344,27 +1344,26 @@ static void command_push_relays(client_t *client, source_t *source, admin_format
         char *end;
         long number;
 
-        COMMAND_REQUIRE(client, "relay_token", token);
-        if (!source->push_relay_token || strcmp(token, source->push_relay_token) != 0) {
-            auth_reject_client_on_deny(client);
-            return;
-        }
-
-        COMMAND_REQUIRE(client, "relay_action", action);
-        COMMAND_REQUIRE(client, "host", host);
-        COMMAND_REQUIRE(client, "port", port);
-        COMMAND_OPTIONAL(client, "target", target);
-        COMMAND_OPTIONAL(client, "protocol", protocol);
+        token = httpp_get_post_param(client->parser, "relay_token");
+        action = httpp_get_post_param(client->parser, "relay_action");
+        host = httpp_get_post_param(client->parser, "host");
+        port = httpp_get_post_param(client->parser, "port");
+        target = httpp_get_post_param(client->parser, "target");
+        protocol = httpp_get_post_param(client->parser, "protocol");
         shoutcast = protocol && strcmp(protocol, "shoutcast") == 0;
-        number = strtol(port, &end, 10);
+        number = port ? strtol(port, &end, 10) : 0;
 
-        if (protocol && !shoutcast && strcmp(protocol, "icecast") != 0) {
+        if (!token || !source->push_relay_token || strcmp(token, source->push_relay_token) != 0) {
+            message = "Form expired or incomplete. Submit the form again from this page.";
+        } else if (!action || !host || !port) {
+            message = "Enter the destination host and port.";
+        } else if (protocol && !shoutcast && strcmp(protocol, "icecast") != 0) {
             message = "Choose Icecast or SHOUTcast v1.";
         } else if (end == port || *end || number < 1 || number > (shoutcast ? 65534 : 65535)) {
             message = "Enter a valid port.";
         } else if (strcmp(action, "add") == 0) {
-            COMMAND_OPTIONAL(client, "username", user);
-            COMMAND_OPTIONAL(client, "password", password);
+            user = httpp_get_post_param(client->parser, "username");
+            password = httpp_get_post_param(client->parser, "password");
             message = source_add_push_relay(source, shoutcast, host, (int)number, target, user, password)
                 ? "Destination added."
                 : "Could not add destination. Check the fields, use an active MP3 source and enter a unique destination (maximum 32).";

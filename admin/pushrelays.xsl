@@ -22,8 +22,7 @@
                                 <td><code><xsl:value-of select="concat(host, ':', port, target)"/></code></td>
                                 <td><xsl:value-of select="status"/></td>
                                 <td>
-                                    <form method="post" action="/admin/pushrelays.xsl">
-                                        <input type="hidden" name="mount" value="{../current_source}"/>
+                                    <form method="post" action="/admin/pushrelays.xsl?mount={../current_source}">
                                         <input type="hidden" name="relay_token" value="{../relay_token}"/>
                                         <input type="hidden" name="relay_action" value="remove"/>
                                         <input type="hidden" name="protocol" value="{protocol}"/>
@@ -41,8 +40,7 @@
             </xsl:if>
             <h4>Add destination</h4>
             <p>Destinations added here apply while this source stays connected.</p>
-            <form method="post" action="/admin/pushrelays.xsl">
-                <input type="hidden" name="mount" value="{current_source}"/>
+            <form method="post" action="/admin/pushrelays.xsl?mount={current_source}">
                 <input type="hidden" name="relay_token" value="{relay_token}"/>
                 <input type="hidden" name="relay_action" value="add"/>
                 <p><label>Protocol <select name="protocol">
