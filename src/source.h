@@ -136,9 +136,9 @@ void source_free_source(source_t *source);
 void source_move_clients(source_t *source, source_t *dest, connection_id_t *id, navigation_direction_t direction);
 int source_remove_client(void *key);
 void source_main(source_t *source);
-bool source_add_push_relay(source_t *source, const char *host, int port,
+bool source_add_push_relay(source_t *source, bool shoutcast, const char *host, int port,
                            const char *target, const char *user, const char *password);
-bool source_remove_push_relay(source_t *source, const char *host, int port, const char *target);
+bool source_remove_push_relay(source_t *source, bool shoutcast, const char *host, int port, const char *target);
 void source_push_relays_xml(source_t *source, xmlNodePtr parent);
 void source_recheck_mounts (int update_all);
 

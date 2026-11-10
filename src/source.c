@@ -809,7 +809,8 @@ typedef struct push_relay {
     char *host, *target, *authorization;
     const char *status;
     int port;
-    bool stopping, overflow;
+    bool shoutcast, stopping, overflow;
+    unsigned int bitrate;
     size_t length;
     char *pending;
     char buffers[2][PUSH_RELAY_BUFFER_SIZE];
@@ -833,7 +834,7 @@ static bool push_relay_write(sock_t socket, const char *data, size_t length)
     return length == 0;
 }
 
-static int push_relay_response(sock_t socket)
+static int push_relay_response(sock_t socket, bool shoutcast)
 {
     char header[4096];
     size_t length = 0;
@@ -848,6 +849,10 @@ static int push_relay_response(sock_t socket)
         if (count != 1)
             break;
         length++;
+        if (shoutcast && header[length - 1] == '\n') {
+            return (length == 4 && memcmp(header, "OK2\n", 4) == 0) ||
+                   (length == 5 && memcmp(header, "OK2\r\n", 5) == 0) ? 100 : 401;
+        }
         if (length >= 4 && memcmp(header + length - 4, "\r\n\r\n", 4) == 0) {
             header[length] = '\0';
             if (sscanf(header, "HTTP/%*u.%*u %d", &status) == 1)
@@ -863,6 +868,57 @@ static void push_relay_status(push_relay_t *relay, const char *status)
     thread_mutex_lock(&relay->lock);
     relay->status = status;
     thread_mutex_unlock(&relay->lock);
+}
+
+static int push_relay_handshake(push_relay_t *relay, sock_t socket)
+{
+    char header[4096];
+    int size;
+
+    if (relay->shoutcast) {
+        size = snprintf(header, sizeof(header), "%s\r\n", relay->authorization);
+        if (size < 1 || (size_t)size >= sizeof(header) ||
+            !push_relay_write(socket, header, size))
+            return 0;
+
+        {
+            int status = push_relay_response(socket, true);
+            if (status != 100)
+                return status;
+        }
+
+        size = snprintf(header, sizeof(header),
+            "icy-name: Icecast relay\r\nicy-pub: 0\r\nicy-br: %u\r\n"
+            "content-type: audio/mpeg\r\n\r\n", relay->bitrate);
+        return size > 0 && (size_t)size < sizeof(header) &&
+            push_relay_write(socket, header, size) ? 100 : 0;
+    }
+
+    size = snprintf(header, sizeof(header),
+        "PUT %s HTTP/1.1\r\nHost: %s:%d\r\n"
+        "Authorization: Basic %s\r\nContent-Type: audio/mpeg\r\n"
+        "Transfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n",
+        relay->target, relay->host, relay->port, relay->authorization);
+    if (size < 1 || (size_t)size >= sizeof(header) ||
+        !push_relay_write(socket, header, size))
+        return 0;
+
+    return push_relay_response(socket, false);
+}
+
+static bool push_relay_send_audio(push_relay_t *relay, sock_t socket,
+                                  const char *audio, size_t length)
+{
+    char chunk[24];
+    int size;
+
+    if (relay->shoutcast)
+        return push_relay_write(socket, audio, length);
+
+    size = snprintf(chunk, sizeof(chunk), "%lx\r\n", (unsigned long)length);
+    return push_relay_write(socket, chunk, size) &&
+           push_relay_write(socket, audio, length) &&
+           push_relay_write(socket, "\r\n", 2);
 }
 
 static void *push_relay_run(void *arg)
@@ -897,21 +953,12 @@ static void *push_relay_run(void *arg)
         }
 
         if (socket == SOCK_ERROR && time(NULL) >= retry) {
-            char header[4096];
-            int size = snprintf(header, sizeof(header),
-                "PUT %s HTTP/1.1\r\nHost: %s:%d\r\n"
-                "Authorization: Basic %s\r\nContent-Type: audio/mpeg\r\n"
-                "Transfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n",
-                relay->target, relay->host, relay->port, relay->authorization);
             int status = 0;
 
             push_relay_status(relay, "Connecting");
-            if (size > 0 && (size_t)size < sizeof(header))
-                socket = sock_connect_wto(relay->host, relay->port, 3);
-            if (socket != SOCK_ERROR &&
-                sock_set_blocking(socket, 0) == 0 &&
-                push_relay_write(socket, header, size))
-                status = push_relay_response(socket);
+            socket = sock_connect_wto(relay->host, relay->port + (relay->shoutcast ? 1 : 0), 3);
+            if (socket != SOCK_ERROR && sock_set_blocking(socket, 0) == 0)
+                status = push_relay_handshake(relay, socket);
 
             if (status == 100) {
                 push_relay_status(relay, "Connected");
@@ -927,11 +974,7 @@ static void *push_relay_run(void *arg)
         }
 
         if (socket != SOCK_ERROR && length) {
-            char chunk[24];
-            int size = snprintf(chunk, sizeof(chunk), "%lx\r\n", (unsigned long)length);
-            if (!push_relay_write(socket, chunk, size) ||
-                !push_relay_write(socket, output, length) ||
-                !push_relay_write(socket, "\r\n", 2)) {
+            if (!push_relay_send_audio(relay, socket, output, length)) {
                 sock_close(socket);
                 socket = SOCK_ERROR;
                 retry = time(NULL) + 5;
@@ -966,7 +1009,7 @@ static void push_relay_free(push_relay_t *relay)
     free(relay);
 }
 
-bool source_add_push_relay(source_t *source, const char *host, int port,
+bool source_add_push_relay(source_t *source, bool shoutcast, const char *host, int port,
                            const char *target, const char *user, const char *password)
 {
     char credentials[1024];
@@ -975,13 +1018,17 @@ bool source_add_push_relay(source_t *source, const char *host, int port,
     push_relay_t *relay;
 
     if (!host || !*host || strlen(host) > 253 || strpbrk(host, " \t\r\n:/") ||
-        port < 1 || port > 65535 || !target || target[0] != '/' ||
-        strlen(target) > 1024 || strpbrk(target, " \t\r\n?#") ||
-        !password || !*password || (user && strchr(user, ':')))
+        port < 1 || port > (shoutcast ? 65534 : 65535) ||
+        !password || !*password || strpbrk(password, "\r\n") ||
+        (!shoutcast && (!target || target[0] != '/' || strlen(target) > 1024 ||
+                       strpbrk(target, " \t\r\n?#") || (user && strchr(user, ':')))))
         return false;
 
-    length = snprintf(credentials, sizeof(credentials), "%s:%s",
-                      user && *user ? user : "source", password);
+    if (shoutcast)
+        target = "";
+    length = shoutcast ? snprintf(credentials, sizeof(credentials), "%s", password) :
+        snprintf(credentials, sizeof(credentials), "%s:%s",
+                 user && *user ? user : "source", password);
     if (length < 0 || (size_t)length >= sizeof(credentials))
         return false;
 
@@ -991,7 +1038,8 @@ bool source_add_push_relay(source_t *source, const char *host, int port,
         goto fail;
 
     for (relay = source->push_relays; relay; relay = relay->next) {
-        if (relay->port == port && strcasecmp(relay->host, host) == 0 &&
+        if (relay->shoutcast == shoutcast && relay->port == port &&
+            strcasecmp(relay->host, host) == 0 &&
             strcmp(relay->target, target) == 0)
             goto fail;
         count++;
@@ -1004,7 +1052,18 @@ bool source_add_push_relay(source_t *source, const char *host, int port,
         goto fail;
     relay->host = strdup(host);
     relay->target = strdup(target);
-    relay->authorization = util_base64_encode(credentials, length);
+    relay->authorization = shoutcast ? strdup(credentials) :
+        util_base64_encode(credentials, length);
+    relay->shoutcast = shoutcast;
+    if (shoutcast) {
+        const char *bitrate = httpp_getvar(source->parser, "ice-bitrate");
+        long number;
+
+        if (!bitrate)
+            bitrate = httpp_getvar(source->parser, "icy-br");
+        number = bitrate ? strtol(bitrate, NULL, 10) : 0;
+        relay->bitrate = number > 0 && number <= 320 ? (unsigned int)number : 0;
+    }
     relay->port = port;
     relay->pending = relay->buffers[0];
     relay->status = "Connecting";
@@ -1027,14 +1086,20 @@ fail:
     return false;
 }
 
-bool source_remove_push_relay(source_t *source, const char *host, int port, const char *target)
+bool source_remove_push_relay(source_t *source, bool shoutcast, const char *host, int port, const char *target)
 {
     push_relay_t **slot;
     push_relay_t *relay;
 
+    if (shoutcast)
+        target = "";
+    if (!target)
+        return false;
+
     thread_mutex_lock(&source->lock);
     for (slot = &source->push_relays; (relay = *slot); slot = &relay->next) {
-        if (relay->port == port && strcasecmp(relay->host, host) == 0 &&
+        if (relay->shoutcast == shoutcast && relay->port == port &&
+            strcasecmp(relay->host, host) == 0 &&
             strcmp(relay->target, target) == 0) {
             *slot = relay->next;
             thread_mutex_unlock(&source->lock);
@@ -1055,6 +1120,8 @@ void source_push_relays_xml(source_t *source, xmlNodePtr parent)
         char port[8];
         xmlNodePtr node = xmlNewChild(parent, NULL, XMLSTR("relay"), NULL);
         snprintf(port, sizeof(port), "%d", relay->port);
+        xmlNewTextChild(node, NULL, XMLSTR("protocol"),
+                        XMLSTR(relay->shoutcast ? "shoutcast" : "icecast"));
         xmlNewTextChild(node, NULL, XMLSTR("host"), XMLSTR(relay->host));
         xmlNewTextChild(node, NULL, XMLSTR("port"), XMLSTR(port));
         xmlNewTextChild(node, NULL, XMLSTR("target"), XMLSTR(relay->target));
@@ -1074,7 +1141,7 @@ static void push_relay_start(source_t *source)
     source->push_relays_open = true;
     thread_mutex_unlock(&source->lock);
     if (mount && mount->push_relay_host &&
-        !source_add_push_relay(source, mount->push_relay_host, mount->push_relay_port,
+        !source_add_push_relay(source, false, mount->push_relay_host, mount->push_relay_port,
                                mount->push_relay_target, mount->push_relay_user,
                                mount->push_relay_password))
         ICECAST_LOG_WARN("Could not start configured push relay for mount %H", source->mount);

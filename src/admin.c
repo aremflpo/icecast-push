@@ -1339,7 +1339,8 @@ static void command_push_relays(client_t *client, source_t *source, admin_format
     const char *message = NULL;
 
     if (client->parser->req_type == httpp_req_post) {
-        const char *action, *host, *port, *target, *user, *password, *token;
+        const char *action, *host, *port, *target, *user, *password, *token, *protocol;
+        bool shoutcast;
         char *end;
         long number;
 
@@ -1352,19 +1353,23 @@ static void command_push_relays(client_t *client, source_t *source, admin_format
         COMMAND_REQUIRE(client, "relay_action", action);
         COMMAND_REQUIRE(client, "host", host);
         COMMAND_REQUIRE(client, "port", port);
-        COMMAND_REQUIRE(client, "target", target);
+        COMMAND_OPTIONAL(client, "target", target);
+        COMMAND_OPTIONAL(client, "protocol", protocol);
+        shoutcast = protocol && strcmp(protocol, "shoutcast") == 0;
         number = strtol(port, &end, 10);
 
-        if (end == port || *end || number < 1 || number > 65535) {
+        if (protocol && !shoutcast && strcmp(protocol, "icecast") != 0) {
+            message = "Choose Icecast or SHOUTcast v1.";
+        } else if (end == port || *end || number < 1 || number > (shoutcast ? 65534 : 65535)) {
             message = "Enter a valid port.";
         } else if (strcmp(action, "add") == 0) {
             COMMAND_OPTIONAL(client, "username", user);
             COMMAND_OPTIONAL(client, "password", password);
-            message = source_add_push_relay(source, host, (int)number, target, user, password)
+            message = source_add_push_relay(source, shoutcast, host, (int)number, target, user, password)
                 ? "Destination added."
                 : "Could not add destination. Check the fields, use an active MP3 source and enter a unique destination (maximum 32).";
         } else if (strcmp(action, "remove") == 0) {
-            message = source_remove_push_relay(source, host, (int)number, target)
+            message = source_remove_push_relay(source, shoutcast, host, (int)number, target)
                 ? "Destination removed." : "Destination no longer exists.";
         }
     }
