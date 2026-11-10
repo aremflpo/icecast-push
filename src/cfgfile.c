@@ -840,6 +840,10 @@ static inline ice_config_http_header_t *config_copy_http_header(ice_config_http_
 
 static void config_clear_mount(mount_proxy *mount)
 {
+    xmlFree(mount->push_relay_host);
+    xmlFree(mount->push_relay_target);
+    xmlFree(mount->push_relay_user);
+    xmlFree(mount->push_relay_password);
     if (mount->mountname)           xmlFree(mount->mountname);
     if (mount->dumpfile)            xmlFree(mount->dumpfile);
     if (mount->intro_filename)      xmlFree(mount->intro_filename);
@@ -1812,6 +1816,33 @@ static void _parse_mount(xmlDocPtr      doc,
         if (xmlStrcmp(node->name, XMLSTR("mount-name")) == 0) {
             mount->mountname = (char *)xmlNodeListGetString(doc,
                 node->xmlChildrenNode, 1);
+        } else if (xmlStrcmp(node->name, XMLSTR("push-relay")) == 0) {
+            char *host = (char *)xmlGetProp(node, XMLSTR("host"));
+            char *target = (char *)xmlGetProp(node, XMLSTR("mount"));
+            char *user = (char *)xmlGetProp(node, XMLSTR("username"));
+            char *secret = (char *)xmlGetProp(node, XMLSTR("password"));
+            char *port = (char *)xmlGetProp(node, XMLSTR("port"));
+            char *end = NULL;
+            long number = port ? strtol(port, &end, 10) : 8000;
+
+            if (!mount->push_relay_host && host && *host &&
+                !strpbrk(host, " \t\r\n:/") && target && target[0] == '/' &&
+                !strpbrk(target, " \t\r\n?#") &&
+                secret && *secret && (!port || (end != port && *end == '\0')) &&
+                number > 0 && number <= 65535) {
+                mount->push_relay_host = host;
+                mount->push_relay_target = target;
+                mount->push_relay_user = user;
+                mount->push_relay_password = secret;
+                mount->push_relay_port = (int)number;
+            } else {
+                ICECAST_LOG_WARN("Invalid or duplicate push-relay configuration");
+                xmlFree(host);
+                xmlFree(target);
+                xmlFree(user);
+                xmlFree(secret);
+            }
+            xmlFree(port);
         } else if (xmlStrcmp(node->name, XMLSTR("username")) == 0) {
             username = (char *)xmlNodeListGetString(doc,
                 node->xmlChildrenNode, 1);

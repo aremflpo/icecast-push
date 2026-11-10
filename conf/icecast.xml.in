@@ -344,4 +344,14 @@
         -->
 
     </security>
+    <!-- Push one local MP3 mount to a remote Icecast source endpoint.
+    <mount>
+        <mount-name>/live.mp3</mount-name>
+        <push-relay host="remote.example.org" port="8000" mount="/relay.mp3"
+                    username="source" password="replace-with-source-password" />
+    </mount>
+    The connection uses HTTP. Configure credentials only on a trusted network.
+    Relay settings are read when a source connects. See its details under Stats.
+    -->
+
 </icecast>

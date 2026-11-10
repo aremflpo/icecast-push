@@ -89,6 +89,12 @@ typedef enum {
 } interpolation_t;
 
 typedef struct _mount_proxy {
+    char *push_relay_host;
+    char *push_relay_target;
+    char *push_relay_user;
+    char *push_relay_password;
+    int push_relay_port;
+
     /* The mountpoint this proxy is used for */
     char *mountname;
     /* The type of the mount point */

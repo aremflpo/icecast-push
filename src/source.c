@@ -797,12 +797,223 @@ static void source_init (source_t *source)
 }
 
 
+/* Each output owns its socket and buffers. The source thread only queues audio. */
+#define PUSH_RELAY_BUFFER_SIZE (64 * 1024)
+
+typedef struct {
+    thread_type *thread;
+    mutex_t lock;
+    char *host, *target, *authorization;
+    const char *mount;
+    int port;
+    bool stopping, overflow;
+    size_t length;
+    char *pending;
+    char buffers[2][PUSH_RELAY_BUFFER_SIZE];
+} push_relay_t;
+
+static bool push_relay_write(sock_t socket, const char *data, size_t length)
+{
+    time_t deadline = time(NULL) + 3;
+
+    while (length && time(NULL) < deadline) {
+        int count = sock_write_bytes(socket, data, length);
+        if (count > 0) {
+            data += count;
+            length -= count;
+        } else if (count == SOCK_ERROR && sock_recoverable(sock_error())) {
+            thread_sleep(10000);
+        } else {
+            return false;
+        }
+    }
+    return length == 0;
+}
+
+static int push_relay_response(sock_t socket)
+{
+    char header[4096];
+    size_t length = 0;
+    time_t deadline = time(NULL) + 3;
+    int status;
+
+    while (length < sizeof(header) - 1 && time(NULL) < deadline) {
+        int count;
+        if (util_timed_wait_for_fd(socket, 100) <= 0)
+            continue;
+        count = sock_read_bytes(socket, header + length, 1);
+        if (count != 1)
+            break;
+        length++;
+        if (length >= 4 && memcmp(header + length - 4, "\r\n\r\n", 4) == 0) {
+            header[length] = '\0';
+            if (sscanf(header, "HTTP/%*u.%*u %d", &status) == 1)
+                return status;
+            break;
+        }
+    }
+    return 0;
+}
+
+static void *push_relay_run(void *arg)
+{
+    push_relay_t *relay = arg;
+    sock_t socket = SOCK_ERROR;
+    char *output = relay->buffers[1];
+    time_t retry = 0;
+
+    for (;;) {
+        size_t length;
+        bool overflow;
+        char *swap;
+
+        thread_mutex_lock(&relay->lock);
+        if (relay->stopping) {
+            thread_mutex_unlock(&relay->lock);
+            break;
+        }
+        length = relay->length;
+        overflow = relay->overflow;
+        relay->length = 0;
+        relay->overflow = false;
+        swap = output;
+        output = relay->pending;
+        relay->pending = swap;
+        thread_mutex_unlock(&relay->lock);
+
+        if (overflow && socket != SOCK_ERROR) {
+            sock_close(socket);
+            socket = SOCK_ERROR;
+        }
+
+        if (socket == SOCK_ERROR && time(NULL) >= retry) {
+            char header[4096];
+            int size = snprintf(header, sizeof(header),
+                "PUT %s HTTP/1.1\r\nHost: %s:%d\r\n"
+                "Authorization: Basic %s\r\nContent-Type: audio/mpeg\r\n"
+                "Transfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n",
+                relay->target, relay->host, relay->port, relay->authorization);
+            int status = 0;
+
+            stats_event(relay->mount, "push_relay", "Connecting");
+            if (size > 0 && (size_t)size < sizeof(header))
+                socket = sock_connect_wto(relay->host, relay->port, 3);
+            if (socket != SOCK_ERROR &&
+                sock_set_blocking(socket, 0) == 0 &&
+                push_relay_write(socket, header, size))
+                status = push_relay_response(socket);
+
+            if (status == 100) {
+                stats_event(relay->mount, "push_relay", "Connected");
+            } else {
+                if (socket != SOCK_ERROR)
+                    sock_close(socket);
+                socket = SOCK_ERROR;
+                retry = time(NULL) + 5;
+                stats_event(relay->mount, "push_relay",
+                    status == 401 || status == 403 ? "Authentication rejected" : "Retrying");
+            }
+            continue;
+        }
+
+        if (socket != SOCK_ERROR && length) {
+            char chunk[24];
+            int size = snprintf(chunk, sizeof(chunk), "%lx\r\n", (unsigned long)length);
+            if (!push_relay_write(socket, chunk, size) ||
+                !push_relay_write(socket, output, length) ||
+                !push_relay_write(socket, "\r\n", 2)) {
+                sock_close(socket);
+                socket = SOCK_ERROR;
+                retry = time(NULL) + 5;
+                stats_event(relay->mount, "push_relay", "Retrying");
+            }
+        } else {
+            thread_sleep(20000);
+        }
+    }
+    if (socket != SOCK_ERROR)
+        sock_close(socket);
+    return NULL;
+}
+
+static void push_relay_free(push_relay_t *relay)
+{
+    if (relay->thread) {
+        thread_mutex_lock(&relay->lock);
+        relay->stopping = true;
+        thread_mutex_unlock(&relay->lock);
+        thread_join(relay->thread);
+        thread_mutex_destroy(&relay->lock);
+    }
+    free(relay->host);
+    free(relay->target);
+    free(relay->authorization);
+    free(relay);
+}
+
+static push_relay_t *push_relay_start(source_t *source)
+{
+    ice_config_t *config = config_get_config();
+    mount_proxy *mount = config_find_mount(config, source->mount, MOUNT_TYPE_NORMAL);
+    push_relay_t *relay = NULL;
+
+    if (mount && mount->push_relay_host) {
+        if (source->format->contenttype &&
+            strcmp(source->format->contenttype, "audio/mpeg") == 0) {
+            char credentials[1024];
+            int length = snprintf(credentials, sizeof(credentials), "%s:%s",
+                mount->push_relay_user ? mount->push_relay_user : "source", mount->push_relay_password);
+            if (length > 0 && (size_t)length < sizeof(credentials))
+                relay = calloc(1, sizeof(*relay));
+            if (relay) {
+                relay->host = strdup(mount->push_relay_host);
+                relay->target = strdup(mount->push_relay_target);
+                relay->authorization = util_base64_encode(credentials, length);
+                relay->port = mount->push_relay_port;
+                relay->mount = source->mount;
+                relay->pending = relay->buffers[0];
+            }
+        } else {
+            stats_event(source->mount, "push_relay", "MP3 input required");
+        }
+    }
+    config_release_config();
+
+    if (relay) {
+        if (relay->host && relay->target && relay->authorization) {
+            thread_mutex_create(&relay->lock);
+            relay->thread = thread_create("Push Relay", push_relay_run, relay, THREAD_ATTACHED);
+            if (relay->thread)
+                return relay;
+            thread_mutex_destroy(&relay->lock);
+        }
+        push_relay_free(relay);
+        stats_event(source->mount, "push_relay", "Could not start");
+    }
+    return NULL;
+}
+
+static void push_relay_queue(push_relay_t *relay, const refbuf_t *buffer)
+{
+    thread_mutex_lock(&relay->lock);
+    if (buffer->len <= PUSH_RELAY_BUFFER_SIZE - relay->length) {
+        memcpy(relay->pending + relay->length, buffer->data, buffer->len);
+        relay->length += buffer->len;
+    } else {
+        relay->length = 0;
+        relay->overflow = true;
+    }
+    thread_mutex_unlock(&relay->lock);
+}
+
 void source_main (source_t *source)
 {
     refbuf_t *refbuf;
     avl_node *client_node;
+    push_relay_t *push_relay;
 
     source_init (source);
+    push_relay = push_relay_start(source);
 
     while (global.running == ICECAST_RUNNING && source->running) {
         source_flags_t old_flags;
@@ -815,6 +1026,9 @@ void source_main (source_t *source)
 
         if (refbuf)
         {
+            if (push_relay)
+                push_relay_queue(push_relay, refbuf);
+
             /* append buffer to the in-flight data queue,  */
             if (source->stream_data == NULL)
             {
@@ -1018,6 +1232,9 @@ static void source_shutdown (source_t *source)
 
         avl_tree_unlock(global.source_tree);
     }
+
+    if (push_relay)
+        push_relay_free(push_relay);
 
     /* delete this sources stats */
     stats_event(source->mount, NULL, NULL);
