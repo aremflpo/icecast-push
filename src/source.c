@@ -110,6 +110,7 @@ source_t *source_reserve (const char *mount)
             break;
         }
 
+        igloo_uuid_new_random_sp(&src->push_relay_token, igloo_instance);
         src->client_tree = avl_tree_new(client_compare, NULL);
         src->pending_tree = avl_tree_new(client_compare, NULL);
         src->history = playlist_new(10 /* DOCUMENT: default is max_tracks=10. */);
@@ -349,6 +350,7 @@ void source_free_source (source_t *source)
     yp_remove (source->mount);
 
     refobject_unref(source->identifier);
+    igloo_sp_unref(&source->push_relay_token, igloo_instance);
     igloo_sp_unref(&source->instance_uuid, igloo_instance);
     free (source->mount);
     free (source);
@@ -800,11 +802,12 @@ static void source_init (source_t *source)
 /* Each output owns its socket and buffers. The source thread only queues audio. */
 #define PUSH_RELAY_BUFFER_SIZE (64 * 1024)
 
-typedef struct {
+typedef struct push_relay {
+    struct push_relay *next;
     thread_type *thread;
     mutex_t lock;
     char *host, *target, *authorization;
-    const char *mount;
+    const char *status;
     int port;
     bool stopping, overflow;
     size_t length;
@@ -855,6 +858,13 @@ static int push_relay_response(sock_t socket)
     return 0;
 }
 
+static void push_relay_status(push_relay_t *relay, const char *status)
+{
+    thread_mutex_lock(&relay->lock);
+    relay->status = status;
+    thread_mutex_unlock(&relay->lock);
+}
+
 static void *push_relay_run(void *arg)
 {
     push_relay_t *relay = arg;
@@ -895,7 +905,7 @@ static void *push_relay_run(void *arg)
                 relay->target, relay->host, relay->port, relay->authorization);
             int status = 0;
 
-            stats_event(relay->mount, "push_relay", "Connecting");
+            push_relay_status(relay, "Connecting");
             if (size > 0 && (size_t)size < sizeof(header))
                 socket = sock_connect_wto(relay->host, relay->port, 3);
             if (socket != SOCK_ERROR &&
@@ -904,13 +914,13 @@ static void *push_relay_run(void *arg)
                 status = push_relay_response(socket);
 
             if (status == 100) {
-                stats_event(relay->mount, "push_relay", "Connected");
+                push_relay_status(relay, "Connected");
             } else {
                 if (socket != SOCK_ERROR)
                     sock_close(socket);
                 socket = SOCK_ERROR;
                 retry = time(NULL) + 5;
-                stats_event(relay->mount, "push_relay",
+                push_relay_status(relay,
                     status == 401 || status == 403 ? "Authentication rejected" : "Retrying");
             }
             continue;
@@ -925,7 +935,7 @@ static void *push_relay_run(void *arg)
                 sock_close(socket);
                 socket = SOCK_ERROR;
                 retry = time(NULL) + 5;
-                stats_event(relay->mount, "push_relay", "Retrying");
+                push_relay_status(relay, "Retrying");
             }
         } else {
             thread_sleep(20000);
@@ -936,12 +946,17 @@ static void *push_relay_run(void *arg)
     return NULL;
 }
 
+static void push_relay_request_stop(push_relay_t *relay)
+{
+    thread_mutex_lock(&relay->lock);
+    relay->stopping = true;
+    thread_mutex_unlock(&relay->lock);
+}
+
 static void push_relay_free(push_relay_t *relay)
 {
     if (relay->thread) {
-        thread_mutex_lock(&relay->lock);
-        relay->stopping = true;
-        thread_mutex_unlock(&relay->lock);
+        push_relay_request_stop(relay);
         thread_join(relay->thread);
         thread_mutex_destroy(&relay->lock);
     }
@@ -951,46 +966,139 @@ static void push_relay_free(push_relay_t *relay)
     free(relay);
 }
 
-static push_relay_t *push_relay_start(source_t *source)
+bool source_add_push_relay(source_t *source, const char *host, int port,
+                           const char *target, const char *user, const char *password)
+{
+    char credentials[1024];
+    int length;
+    unsigned int count = 0;
+    push_relay_t *relay;
+
+    if (!host || !*host || strlen(host) > 253 || strpbrk(host, " \t\r\n:/") ||
+        port < 1 || port > 65535 || !target || target[0] != '/' ||
+        strlen(target) > 1024 || strpbrk(target, " \t\r\n?#") ||
+        !password || !*password || (user && strchr(user, ':')))
+        return false;
+
+    length = snprintf(credentials, sizeof(credentials), "%s:%s",
+                      user && *user ? user : "source", password);
+    if (length < 0 || (size_t)length >= sizeof(credentials))
+        return false;
+
+    thread_mutex_lock(&source->lock);
+    if (!source->push_relays_open || !source->format->contenttype ||
+        strcmp(source->format->contenttype, "audio/mpeg") != 0)
+        goto fail;
+
+    for (relay = source->push_relays; relay; relay = relay->next) {
+        if (relay->port == port && strcasecmp(relay->host, host) == 0 &&
+            strcmp(relay->target, target) == 0)
+            goto fail;
+        count++;
+    }
+    if (count >= 32)
+        goto fail;
+
+    relay = calloc(1, sizeof(*relay));
+    if (!relay)
+        goto fail;
+    relay->host = strdup(host);
+    relay->target = strdup(target);
+    relay->authorization = util_base64_encode(credentials, length);
+    relay->port = port;
+    relay->pending = relay->buffers[0];
+    relay->status = "Connecting";
+
+    if (relay->host && relay->target && relay->authorization) {
+        thread_mutex_create(&relay->lock);
+        relay->thread = thread_create("Push Relay", push_relay_run, relay, THREAD_ATTACHED);
+        if (relay->thread) {
+            relay->next = source->push_relays;
+            source->push_relays = relay;
+            thread_mutex_unlock(&source->lock);
+            return true;
+        }
+        thread_mutex_destroy(&relay->lock);
+    }
+    push_relay_free(relay);
+
+fail:
+    thread_mutex_unlock(&source->lock);
+    return false;
+}
+
+bool source_remove_push_relay(source_t *source, const char *host, int port, const char *target)
+{
+    push_relay_t **slot;
+    push_relay_t *relay;
+
+    thread_mutex_lock(&source->lock);
+    for (slot = &source->push_relays; (relay = *slot); slot = &relay->next) {
+        if (relay->port == port && strcasecmp(relay->host, host) == 0 &&
+            strcmp(relay->target, target) == 0) {
+            *slot = relay->next;
+            thread_mutex_unlock(&source->lock);
+            push_relay_free(relay);
+            return true;
+        }
+    }
+    thread_mutex_unlock(&source->lock);
+    return false;
+}
+
+void source_push_relays_xml(source_t *source, xmlNodePtr parent)
+{
+    push_relay_t *relay;
+
+    thread_mutex_lock(&source->lock);
+    for (relay = source->push_relays; relay; relay = relay->next) {
+        char port[8];
+        xmlNodePtr node = xmlNewChild(parent, NULL, XMLSTR("relay"), NULL);
+        snprintf(port, sizeof(port), "%d", relay->port);
+        xmlNewTextChild(node, NULL, XMLSTR("host"), XMLSTR(relay->host));
+        xmlNewTextChild(node, NULL, XMLSTR("port"), XMLSTR(port));
+        xmlNewTextChild(node, NULL, XMLSTR("target"), XMLSTR(relay->target));
+        thread_mutex_lock(&relay->lock);
+        xmlNewTextChild(node, NULL, XMLSTR("status"), XMLSTR(relay->status));
+        thread_mutex_unlock(&relay->lock);
+    }
+    thread_mutex_unlock(&source->lock);
+}
+
+static void push_relay_start(source_t *source)
 {
     ice_config_t *config = config_get_config();
     mount_proxy *mount = config_find_mount(config, source->mount, MOUNT_TYPE_NORMAL);
-    push_relay_t *relay = NULL;
 
-    if (mount && mount->push_relay_host) {
-        if (source->format->contenttype &&
-            strcmp(source->format->contenttype, "audio/mpeg") == 0) {
-            char credentials[1024];
-            int length = snprintf(credentials, sizeof(credentials), "%s:%s",
-                mount->push_relay_user ? mount->push_relay_user : "source", mount->push_relay_password);
-            if (length > 0 && (size_t)length < sizeof(credentials))
-                relay = calloc(1, sizeof(*relay));
-            if (relay) {
-                relay->host = strdup(mount->push_relay_host);
-                relay->target = strdup(mount->push_relay_target);
-                relay->authorization = util_base64_encode(credentials, length);
-                relay->port = mount->push_relay_port;
-                relay->mount = source->mount;
-                relay->pending = relay->buffers[0];
-            }
-        } else {
-            stats_event(source->mount, "push_relay", "MP3 input required");
-        }
-    }
+    thread_mutex_lock(&source->lock);
+    source->push_relays_open = true;
+    thread_mutex_unlock(&source->lock);
+    if (mount && mount->push_relay_host &&
+        !source_add_push_relay(source, mount->push_relay_host, mount->push_relay_port,
+                               mount->push_relay_target, mount->push_relay_user,
+                               mount->push_relay_password))
+        ICECAST_LOG_WARN("Could not start configured push relay for mount %H", source->mount);
     config_release_config();
+}
 
-    if (relay) {
-        if (relay->host && relay->target && relay->authorization) {
-            thread_mutex_create(&relay->lock);
-            relay->thread = thread_create("Push Relay", push_relay_run, relay, THREAD_ATTACHED);
-            if (relay->thread)
-                return relay;
-            thread_mutex_destroy(&relay->lock);
-        }
+static void push_relay_stop_all(source_t *source)
+{
+    push_relay_t *relay, *pending;
+
+    thread_mutex_lock(&source->lock);
+    source->push_relays_open = false;
+    relay = source->push_relays;
+    source->push_relays = NULL;
+    thread_mutex_unlock(&source->lock);
+
+    for (pending = relay; pending; pending = pending->next)
+        push_relay_request_stop(pending);
+
+    while (relay) {
+        push_relay_t *next = relay->next;
         push_relay_free(relay);
-        stats_event(source->mount, "push_relay", "Could not start");
+        relay = next;
     }
-    return NULL;
 }
 
 static void push_relay_queue(push_relay_t *relay, const refbuf_t *buffer)
@@ -1010,10 +1118,8 @@ void source_main (source_t *source)
 {
     refbuf_t *refbuf;
     avl_node *client_node;
-    push_relay_t *push_relay;
-
     source_init (source);
-    push_relay = push_relay_start(source);
+    push_relay_start(source);
 
     while (global.running == ICECAST_RUNNING && source->running) {
         source_flags_t old_flags;
@@ -1026,8 +1132,11 @@ void source_main (source_t *source)
 
         if (refbuf)
         {
-            if (push_relay)
-                push_relay_queue(push_relay, refbuf);
+            push_relay_t *relay;
+            thread_mutex_lock(&source->lock);
+            for (relay = source->push_relays; relay; relay = relay->next)
+                push_relay_queue(relay, refbuf);
+            thread_mutex_unlock(&source->lock);
 
             /* append buffer to the in-flight data queue,  */
             if (source->stream_data == NULL)
@@ -1202,9 +1311,7 @@ void source_main (source_t *source)
         /* release write lock on client_tree */
         avl_tree_unlock(source->client_tree);
     }
-    if (push_relay)
-        push_relay_free(push_relay);
-
+    push_relay_stop_all(source);
     source_shutdown (source);
 }
 

@@ -7,6 +7,7 @@
                 <li><a href="/admin/listclients.xsl?mount={$mount}">Listeners</a></li>
                 <li><a href="/admin/moveclients.xsl?mount={$mount}">Move listeners</a></li>
                 <li><a href="/admin/updatemetadata.xsl?mount={$mount}">Metadata</a></li>
+                <li><a href="/admin/pushrelays.xsl?mount={$mount}">Push Relays</a></li>
                 <li><a href="/admin/fallbacks.xsl?mount={$mount}&amp;omode=strict">Set fallback</a></li>
                 <xsl:choose>
                     <xsl:when test="dumpfile_written/text() != '0'">

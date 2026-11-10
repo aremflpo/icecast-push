@@ -6,6 +6,7 @@ nobase_dist_admin_DATA = \
     listclients.xsl \
     listmounts.xsl \
     moveclients.xsl \
+    pushrelays.xsl \
     response.xsl \
     stats.xsl \
     manageauth.xsl \

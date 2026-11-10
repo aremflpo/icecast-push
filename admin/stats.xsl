@@ -58,10 +58,6 @@
                     <!-- Mount nav -->
                     <xsl:call-template name="mountnav" />
                     <xsl:call-template name="player" />
-                    <xsl:if test="push_relay">
-                        <h4>Push Relay</h4>
-                        <p role="status"><xsl:value-of select="push_relay" /></p>
-                    </xsl:if>
                     <h4>Further information</h4>
                     <table class="table-block">
                         <thead>
@@ -71,7 +67,7 @@
                             </tr>
                         </thead>
                         <tbody>
-                            <xsl:for-each select="*[not(self::metadata) and not(self::authentication) and not(self::authenticator) and not(self::listener) and not(self::push_relay)]">
+                            <xsl:for-each select="*[not(self::metadata) and not(self::authentication) and not(self::authenticator) and not(self::listener)]">
                                 <tr>
                                     <td><xsl:value-of select="name()" /></td>
                                     <td><xsl:value-of select="text()" /></td>

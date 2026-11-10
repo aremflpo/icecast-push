@@ -91,6 +91,7 @@
 #define COMMAND_OPTIONAL(client,name,var) \
 (var) = httpp_get_param((client)->parser, (name))
 
+#define PUSH_RELAYS_HTML_REQUEST            "pushrelays.xsl"
 #define FALLBACK_RAW_REQUEST                "fallbacks"
 #define FALLBACK_HTML_REQUEST               "fallbacks.xsl"
 #define FALLBACK_JSON_REQUEST               "fallbacks.json"
@@ -179,6 +180,7 @@ static void command_kill_client         (client_t *client, source_t *source, adm
 static void command_kill_source         (client_t *client, source_t *source, admin_format_t response);
 static void command_dumpfile_control    (client_t *client, source_t *source, admin_format_t response);
 static void command_manageauth          (client_t *client, source_t *source, admin_format_t response);
+static void command_push_relays          (client_t *client, source_t *source, admin_format_t response);
 static void command_updatemetadata      (client_t *client, source_t *source, admin_format_t response);
 static void command_buildm3u            (client_t *client, source_t *source, admin_format_t response);
 static void command_eventstream         (client_t *client, source_t *source, admin_format_t response);
@@ -190,6 +192,7 @@ static void command_version             (client_t *client, source_t *source, adm
 static const admin_command_handler_t handlers[] = {
     { "*",                                  ADMINTYPE_GENERAL,      ADMIN_FORMAT_HTML,          ADMINSAFE_UNSAFE,   NULL, NULL}, /* for ACL framework */
     { FALLBACK_RAW_REQUEST,                 ADMINTYPE_MOUNT,        ADMIN_FORMAT_RAW,           ADMINSAFE_HYBRID,   command_fallback, NULL},
+    { PUSH_RELAYS_HTML_REQUEST,            ADMINTYPE_MOUNT,        ADMIN_FORMAT_HTML,          ADMINSAFE_HYBRID,   command_push_relays, NULL},
     { FALLBACK_HTML_REQUEST,                ADMINTYPE_MOUNT,        ADMIN_FORMAT_HTML,          ADMINSAFE_HYBRID,   command_fallback, NULL},
     { FALLBACK_JSON_REQUEST,                ADMINTYPE_MOUNT,        ADMIN_FORMAT_JSON,          ADMINSAFE_HYBRID,   command_fallback, NULL},
     { METADATA_RAW_REQUEST,                 ADMINTYPE_MOUNT,        ADMIN_FORMAT_RAW,           ADMINSAFE_UNSAFE,   command_metadata, NULL},
@@ -1327,6 +1330,56 @@ static void command_kill_client(client_t *client,
         snprintf(buf, sizeof(buf)-1, "Client %d not found", id);
         admin_send_response_simple(client, source, response, buf, 0);
     }
+}
+
+static void command_push_relays(client_t *client, source_t *source, admin_format_t response)
+{
+    xmlDocPtr doc;
+    xmlNodePtr root;
+    const char *message = NULL;
+
+    if (client->parser->req_type == httpp_req_post) {
+        const char *action, *host, *port, *target, *user, *password, *token;
+        char *end;
+        long number;
+
+        COMMAND_REQUIRE(client, "relay_token", token);
+        if (!source->push_relay_token || strcmp(token, source->push_relay_token) != 0) {
+            auth_reject_client_on_deny(client);
+            return;
+        }
+
+        COMMAND_REQUIRE(client, "relay_action", action);
+        COMMAND_REQUIRE(client, "host", host);
+        COMMAND_REQUIRE(client, "port", port);
+        COMMAND_REQUIRE(client, "target", target);
+        number = strtol(port, &end, 10);
+
+        if (end == port || *end || number < 1 || number > 65535) {
+            message = "Enter a valid port.";
+        } else if (strcmp(action, "add") == 0) {
+            COMMAND_OPTIONAL(client, "username", user);
+            COMMAND_OPTIONAL(client, "password", password);
+            message = source_add_push_relay(source, host, (int)number, target, user, password)
+                ? "Destination added."
+                : "Could not add destination. Check the fields, use an active MP3 source and enter a unique destination (maximum 32).";
+        } else if (strcmp(action, "remove") == 0) {
+            message = source_remove_push_relay(source, host, (int)number, target)
+                ? "Destination removed." : "Destination no longer exists.";
+        }
+    }
+
+    doc = xmlNewDoc(XMLSTR("1.0"));
+    root = xmlNewNode(NULL, XMLSTR("icestats"));
+    xmlDocSetRootElement(doc, root);
+    xmlNewTextChild(root, NULL, XMLSTR("current_source"), XMLSTR(source->mount));
+    if (message)
+        xmlNewTextChild(root, NULL, XMLSTR("message"), XMLSTR(message));
+    if (source->push_relay_token)
+        xmlNewTextChild(root, NULL, XMLSTR("relay_token"), XMLSTR(source->push_relay_token));
+    source_push_relays_xml(source, root);
+    admin_send_response(doc, client, response, PUSH_RELAYS_HTML_REQUEST);
+    xmlFreeDoc(doc);
 }
 
 static void command_fallback(client_t *client,
