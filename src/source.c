@@ -1202,6 +1202,9 @@ void source_main (source_t *source)
         /* release write lock on client_tree */
         avl_tree_unlock(source->client_tree);
     }
+    if (push_relay)
+        push_relay_free(push_relay);
+
     source_shutdown (source);
 }
 
@@ -1232,9 +1235,6 @@ static void source_shutdown (source_t *source)
 
         avl_tree_unlock(global.source_tree);
     }
-
-    if (push_relay)
-        push_relay_free(push_relay);
 
     /* delete this sources stats */
     stats_event(source->mount, NULL, NULL);
